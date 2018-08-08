@@ -11,7 +11,7 @@ from lektor.build_programs import BuildProgram
 from lektor.context import get_ctx
 from lektor.context import url_to
 from lektor.db import F
-from lektor.environment import Expression
+from lektor.environment import Expression, FormatExpression
 from lektor.pluginsystem import Plugin
 from lektor.sourceobj import VirtualSourceObject
 from lektor.utils import build_url
@@ -38,8 +38,13 @@ class AtomFeedSource(VirtualSourceObject):
 
     @property
     def url_path(self):
-        p = self.plugin.get_atom_config(self.feed_id, "url_path")
+        p = self.plugin.get_atom_config(self.feed_id, 'url_path',
+                                        alt=self.alt)
         if p:
+            cfg = self.plugin.env.load_config()
+            primary_alts = '_primary', cfg.primary_alternative
+            if self.alt not in primary_alts:
+                p = "/%s%s" % (self.alt, p)
             return p
 
         return build_url([self.parent.url_path, self.filename])
@@ -49,13 +54,15 @@ class AtomFeedSource(VirtualSourceObject):
 
     def __getattr__(self, item):
         try:
-            return self.plugin.get_atom_config(self.feed_id, item)
+            return self.plugin.get_atom_config(self.feed_id, item,
+                                               alt=self.alt)
         except KeyError:
             raise AttributeError(item)
 
     @property
     def feed_name(self):
-        return self.plugin.get_atom_config(self.feed_id, "name") or self.feed_id
+        return self.plugin.get_atom_config(self.feed_id, 'name', alt=self.alt) \
+            or self.feed_id
 
 
 def get(item, field, default=None):
@@ -75,13 +82,6 @@ def get_item_title(item, field):
     return item.record_label
 
 
-def get_item_body(item, field):
-    if field not in item:
-        raise RuntimeError("Body field %r not found in %r" % (field, item))
-    with get_ctx().changed_base_url(item.url_path):
-        return text_type(escape(item[field]))
-
-
 def get_item_updated(item, field):
     if field in item:
         rv = item[field]
@@ -93,6 +93,14 @@ def get_item_updated(item, field):
 
 
 class AtomFeedBuilderProgram(BuildProgram):
+    def format_expression(self, expression, record, env):
+        with get_ctx().changed_base_url(record.url_path):
+            return FormatExpression(env, expression).evaluate(
+                record.pad,
+                this=record,
+                alt=record.alt
+            )
+
     def produce_artifacts(self):
         self.declare_artifact(
             self.source.url_path, sources=list(self.source.iter_source_filenames())
@@ -103,20 +111,24 @@ class AtomFeedBuilderProgram(BuildProgram):
         feed_source = self.source
         blog = feed_source.parent
 
-        summary = get(blog, feed_source.blog_summary_field) or ""
-        if hasattr(summary, "__html__"):
-            subtitle_type = "html"
-            summary = text_type(summary.__html__())
-        else:
-            subtitle_type = "text"
-        blog_author = text_type(get(blog, feed_source.blog_author_field) or "")
+        summary = self.format_expression(
+            feed_source.blog_summary,
+            blog,
+            ctx.env
+        )
+
+        blog_author = self.format_expression(
+            feed_source.blog_author,
+            blog,
+            ctx.env
+        )
 
         feed = Atom1Feed(
             title=feed_source.feed_name,
             subtitle=summary,
             author_name=blog_author,
-            feed_url=url_to(feed_source, external=True),
-            link=url_to(blog, external=True),
+            feed_url=url_to(feed_source, external=True, alt=feed_source.alt),
+            link=url_to(blog, external=True, alt=feed_source.alt),
             feed_guid=get_id(ctx.env.project.id),
             description=None,
         )
@@ -128,6 +140,10 @@ class AtomFeedBuilderProgram(BuildProgram):
         else:
             items = blog.children
 
+        # Don’t force the user to think about alt when specifying an items
+        # query.
+        items.alt = feed_source.alt
+
         if feed_source.item_model:
             items = items.filter(F._model == feed_source.item_model)
 
@@ -136,13 +152,26 @@ class AtomFeedBuilderProgram(BuildProgram):
 
         for item in items:
             try:
-                item_author_field = feed_source.item_author_field
-                item_author = get(item, item_author_field) or blog_author
+                item_author = self.format_expression(
+                    feed_source.item_author,
+                    item,
+                    ctx.env
+                ) or blog_author
 
+                body = self.format_expression(
+                    feed_source.item_body,
+                    item,
+                    ctx.env
+                )
+                title = self.format_expression(
+                    feed_source.item_title,
+                    item,
+                    ctx.env
+                )
                 feed.add_item(
-                    title=get_item_title(item, feed_source.item_title_field),
+                    title=title,
                     description=None,
-                    content=get_item_body(item, feed_source.item_body_field),
+                    content=body,
                     link=url_to(item, external=True),
                     unique_id=get_id(
                         u"%s/%s" % (ctx.env.project.id, item["_path"].encode("utf-8"))
@@ -168,20 +197,30 @@ class AtomPlugin(Plugin):
         "name": None,
         "url_path": None,
         "filename": "feed.xml",
-        "blog_author_field": "author",
-        "blog_summary_field": "summary",
+        "blog_author": "{{ this.author }}",
+        "blog_summary": "{{ this.summary }}",
         "items": None,
         "limit": 50,
-        "item_title_field": "title",
-        "item_body_field": "body",
-        "item_author_field": "author",
+        "item_title": "{{ this.title or this.record_label }}",
+        "item_body": "{{ this.body }}",
+        "item_author": "{{ this.author }}",
         "item_date_field": "pub_date",
         "item_model": None,
     }
 
-    def get_atom_config(self, feed_id, key):
+    def get_atom_config(self, feed_id, key, alt=None):
         default_value = self.defaults[key]
-        return self.get_config().get("%s.%s" % (feed_id, key), default_value)
+        config = self.get_config()
+        primary_value = config.get(
+            "%s.%s" % (feed_id, key),
+            default_value
+        )
+        localized_value = (
+            config.get("%s.%s.%s" % (feed_id, alt, key))
+            if alt
+            else None
+        )
+        return localized_value or primary_value
 
     def on_setup_env(self, **extra):
         self.env.add_build_program(AtomFeedSource, AtomFeedBuilderProgram)
@@ -196,46 +235,64 @@ class AtomPlugin(Plugin):
 
             _id = pieces[0]
 
-            config = self.get_config()
-            if _id not in config.sections():
+            if _id not in self._feed_ids():
                 return
 
-            source_path = self.get_atom_config(_id, "source_path")
+            source_path = self.get_atom_config(_id, "source_path",
+                                               alt=node.alt)
             if node.path == source_path:
                 return AtomFeedSource(node, _id, plugin=self)
 
         @self.env.generator
         def generate_feeds(source):
-            for _id in self.get_config().sections():
-                if source.path == self.get_atom_config(_id, "source_path"):
+            for _id in self._feed_ids():
+                if source.path == self.get_atom_config(_id, "source_path",
+                                                       alt=source.alt):
                     yield AtomFeedSource(source, _id, self)
 
-    def _all_feeds(self):
+    def _feed_ids(self):
+        feed_ids = set()
+        for section in self.get_config().sections():
+            if '.' in section:
+                feed_id, _alt = section.split(".")
+            else:
+                feed_id = section
+            feed_ids.add(feed_id)
+
+        return feed_ids
+
+    def _all_feeds(self, alt=None):
         ctx = get_ctx()
 
         feeds = []
-        for feed_id in self.get_config().sections():
-            path = self.get_atom_config(feed_id, 'source_path')
-            feed = ctx.pad.get('%s@atom/%s' % (path, feed_id))
+        for feed_id in self._feed_ids():
+            path = self.get_atom_config(feed_id, 'source_path', alt=alt)
+            feed = ctx.pad.get(
+                '%s@atom/%s' % (path, feed_id),
+                alt=alt or ctx.record.alt
+            )
             if feed:
                 feeds.append(feed)
 
         return feeds
 
-    def _feeds_for(self, page):
+    def _feeds_for(self, page, alt=None):
         ctx = get_ctx()
         record = page.record
 
         feeds = []
-        for section in self.get_config().sections():
-            feed = ctx.pad.get('%s@atom/%s' % (record.path, section))
+        for section in self._feed_ids():
+            feed = ctx.pad.get(
+                '%s@atom/%s' % (record.path, section),
+                alt=alt or ctx.record.alt
+            )
             if feed:
                 feeds.append(feed)
 
         return feeds
 
-    def atom_feeds(self, for_page=None):
+    def atom_feeds(self, for_page=None, alt=None):
         if not for_page:
-            return self._all_feeds()
+            return self._all_feeds(alt=alt)
         else:
-            return self._feeds_for(for_page)
+            return self._feeds_for(for_page, alt=alt)
